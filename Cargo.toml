@@ -1,0 +1,19 @@
+[package]
+name = "tcplink"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+base64 = "0.13"
+bytes = "1.2"
+clap = "4.0"
+etherparse = "0.12"
+futures = "0.3"
+headers = "0.3"
+httparse = "1.8"
+ipnet = "2.5"
+tokio = { version = "1", features = ["rt-multi-thread", "io-util", "net", "macros"] }
+tokio-tun = "0.7"
+tokio-util = { version = "0.7", features = ["codec"] }
