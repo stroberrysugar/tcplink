@@ -1,26 +1,35 @@
-use std::{net::SocketAddr, str::FromStr};
+use std::{io::Read, net::SocketAddr, path::PathBuf, str::FromStr};
 
 use clap::{Arg, ArgAction, ArgGroup, Command};
+use generic_array::GenericArray;
 use headers::{HeaderName, HeaderValue};
 use ipnet::Ipv4Net;
+use typenum::U32;
+use zeroize::{DefaultIsZeroes, Zeroizing};
 
 pub struct Config {
     pub interface_name: String,
     pub interface_address: Option<Ipv4Net>,
     pub instance_type: InstanceType,
-    pub http_proxy: Option<HttpProxy>,
+    pub key: Option<Zeroizing<Key>>,
+    pub headers: Option<Vec<(HeaderName, HeaderValue)>>,
     pub debug: bool,
 }
+
+#[derive(Clone, Copy)]
+pub struct Key(pub GenericArray<u8, U32>);
+
+impl Default for Key {
+    fn default() -> Self {
+        Self(Default::default())
+    }
+}
+
+impl DefaultIsZeroes for Key {}
 
 pub enum InstanceType {
     Client(SocketAddr),
     Server(SocketAddr),
-}
-
-pub struct HttpProxy {
-    pub address: SocketAddr,
-    pub user_pass: Option<(String, String)>,
-    pub headers: Option<Vec<(HeaderName, HeaderValue)>>,
 }
 
 pub fn get_config() -> Config {
@@ -51,41 +60,23 @@ pub fn get_config() -> Config {
                 .value_parser(clap::value_parser!(SocketAddr)),
         )
         .arg(
+            Arg::new("key-file")
+                .long("key-file")
+                .short('k')
+                .value_parser(clap::value_parser!(PathBuf)),
+        )
+        .arg(
             Arg::new("debug")
                 .long("debug")
                 .short('d')
-                .action(ArgAction::Set),
-        )
-        .arg(
-            Arg::new("http-proxy-address")
-                .long("http-proxy-address")
-                .short('x')
-                .value_parser(clap::value_parser!(SocketAddr))
-                .conflicts_with("listen"),
-        )
-        .arg(
-            Arg::new("http-proxy-username")
-                .long("http-proxy-username")
-                .short('u')
-                .value_parser(clap::value_parser!(String))
-                .requires("http-proxy-address")
-                .requires("http-proxy-password"),
-        )
-        .arg(
-            Arg::new("http-proxy-password")
-                .long("http-proxy-password")
-                .short('p')
-                .value_parser(clap::value_parser!(String))
-                .requires("http-proxy-address")
-                .requires("http-proxy-username"),
+                .action(ArgAction::SetTrue),
         )
         .arg(
             Arg::new("http-proxy-header-value")
                 .long("http-proxy-header-value")
                 .short('H')
                 .value_parser(clap::value_parser!(String))
-                .action(ArgAction::Append)
-                .requires("http-proxy-address"),
+                .action(ArgAction::Append),
         )
         .group(
             ArgGroup::new("server-or-client")
@@ -109,37 +100,29 @@ pub fn get_config() -> Config {
             .unwrap_or_else(|| {
                 InstanceType::Client(*matches.get_one::<SocketAddr>("connect").unwrap())
             }),
-        http_proxy: matches
-            .get_one::<SocketAddr>("http-proxy-address")
-            .map(|address| HttpProxy {
-                address: *address,
-                user_pass: matches
-                    .get_one::<String>("http-proxy-username")
-                    .map(|username| {
-                        (
-                            username.to_owned(),
-                            matches
-                                .get_one::<String>("http-proxy-password")
-                                .unwrap()
-                                .to_owned(),
-                        )
-                    }),
-                headers: matches
-                    .get_many::<String>("http-proxy-header-value")
-                    .map(|x| {
-                        x.map(|x| {
-                            let (name, value) = x.split_once(':').expect(
-                                "Invalid header value pair (expected `HeaderName: HeaderValue`)",
-                            );
+        key: matches.get_one::<PathBuf>("key-file").map(|x| {
+            let mut key = GenericArray::clone_from_slice(&[0u8; 32]);
+            std::fs::File::open(x)
+                .expect("Failed to open keyfile for reading")
+                .read_exact(key.as_mut_slice())
+                .expect("Failed to read keyfile");
+            Zeroizing::new(Key(key))
+        }),
+        headers: matches
+            .get_many::<String>("http-proxy-header-value")
+            .map(|x| {
+                x.map(|x| {
+                    let (name, value) = x
+                        .split_once(':')
+                        .expect("Invalid header value pair (expected `HeaderName: HeaderValue`)");
 
-                            (
-                                HeaderName::from_str(name).expect("Invalid header name"),
-                                HeaderValue::from_str(value).expect("Invalid header value"),
-                            )
-                        })
-                        .collect()
-                    }),
+                    (
+                        HeaderName::from_str(name).expect("Invalid header name"),
+                        HeaderValue::from_str(value).expect("Invalid header value"),
+                    )
+                })
+                .collect()
             }),
-        debug: matches.contains_id("debug"),
+        debug: *matches.get_one::<bool>("debug").unwrap(),
     }
 }

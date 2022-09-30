@@ -6,14 +6,15 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-base64 = "0.13"
-bytes = "1.2"
+chacha20poly1305 = "0.10"
 clap = "4.0"
 etherparse = "0.12"
 futures = "0.3"
+generic-array = "0.14"
 headers = "0.3"
 httparse = "1.8"
 ipnet = "2.5"
-tokio = { version = "1", features = ["rt-multi-thread", "io-util", "net", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "io-util", "net", "time", "sync", "parking_lot", "macros"] }
 tokio-tun = "0.7"
-tokio-util = { version = "0.7", features = ["codec"] }
+typenum = "1.15"
+zeroize = { version = "1.5", features = ["zeroize_derive"] }
