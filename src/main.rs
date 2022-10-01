@@ -9,9 +9,8 @@ use std::{
 };
 
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::mpsc::channel,
     time::timeout,
 };
 
@@ -28,6 +27,12 @@ use tokio_tun::{Tun, TunBuilder};
 use zeroize::Zeroizing;
 
 use self::clap::InstanceType;
+
+#[derive(Clone, Copy)]
+struct TCPProgress {
+    len: usize,
+    nbytes: usize,
+}
 
 #[tokio::main]
 async fn main() {
@@ -175,26 +180,20 @@ async fn handle_stream(
 ) -> Result<()> {
     let cipher = key.as_ref().map(|key| XChaCha20Poly1305::new(&key.0));
 
-    static mut buf_tun: [u8; 65615] = [0u8; 65575 + 24 + 16];
-    static mut buf_tcp: [u8; 65615] = [0u8; 65575 + 24 + 16];
+    let mut buf_tun = [0u8; 65575 + 24 + 16];
+    let mut buf_tcp = [0u8; 65575 + 24 + 16];
 
-    let (mut tcp_read, tcp_write) = tokio::io::split(stream);
+    let mut tcp_progress: Option<TCPProgress> = None;
 
-    let (tcp_tx, tcp_rx) = channel::<usize>(1);
+    let tun_handle = tokio::spawn(async move {});
+    let tcp_handle = tokio::spawn(async move {});
 
-    tokio::spawn(async move {
-        loop {
-            next_packet(&mut tcp_read, &mut unsafe { buf_tun }, index);
-        }
-    });
-
-    let mut buf1 = [0u8; 65575 + 24 + 16];
-    let mut buf2 = [0u8; 65575 + 24 + 16];
+    tun_handle.await?;
 
     loop {
         let either = tokio::select! {
-            v = tun.read(&mut buf1[24 + 16..]) => Either::Left(v?),
-            v = next_packet(stream, &mut buf2, index) => Either::Right(match v {
+            v = tun.read(&mut buf_tun[24 + 16..]) => Either::Left(v?),
+            v = next_packet(stream, &mut buf_tcp, &mut tcp_progress, index) => Either::Right(match v {
                 Some(v) => v?,
                 None => break,
             }),
@@ -206,7 +205,7 @@ async fn handle_stream(
                     println!("[{}] Read {} bytes from TUN device", index, nbytes);
 
                     debug_packet(
-                        &buf1[24 + 16..24 + 16 + nbytes],
+                        &buf_tun[24 + 16..24 + 16 + nbytes],
                         "Sending packet to stream",
                         index,
                     )?;
@@ -220,17 +219,17 @@ async fn handle_stream(
                         .encrypt_in_place_detached(
                             &nonce,
                             b"",
-                            &mut buf1[24 + 16..24 + 16 + nbytes],
+                            &mut buf_tun[24 + 16..24 + 16 + nbytes],
                         )
                         .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
 
-                    buf1[..24].copy_from_slice(nonce.as_slice());
-                    buf1[24..24 + 16].copy_from_slice(tag.as_slice());
+                    buf_tun[..24].copy_from_slice(nonce.as_slice());
+                    buf_tun[24..24 + 16].copy_from_slice(tag.as_slice());
 
                     offset = 0;
                 }
 
-                send_packet(stream, &buf1[offset..24 + 16 + nbytes], index).await?;
+                send_packet(stream, &buf_tun[offset..24 + 16 + nbytes], index).await?;
             }
             Either::Right(buf) => {
                 let mut offset = 0;
@@ -266,48 +265,66 @@ async fn handle_stream(
     Ok(())
 }
 
-pub async fn next_packet<'a, S>(
+async fn next_packet<'a, S>(
     stream: &mut S,
     buf: &'a mut [u8; 65575 + 24 + 16],
+    progress_opt: &mut Option<TCPProgress>,
     index: usize,
 ) -> Option<Result<&'a mut [u8]>>
 where
     S: AsyncRead + Unpin,
 {
-    let mut len = [0u8; 4];
+    let progress = match progress_opt {
+        Some(n) => n,
+        None => {
+            let mut len = [0u8; 4];
 
-    match stream.read_exact(&mut len).await {
-        Ok(n) if n == 4 => {}
-        Ok(_) => return Some(Err(Error::new(ErrorKind::Other, "Unexpected EOF"))),
-        Err(e) => {
-            return Some(Err(Error::new(
-                ErrorKind::Other,
-                format!("1 - {} - {:?}", e, len),
-            )))
+            match stream.read_exact(&mut len).await {
+                Ok(n) if n == 4 => {}
+                Ok(_) => return Some(Err(Error::new(ErrorKind::Other, "Unexpected EOF"))),
+                Err(e) => {
+                    return Some(Err(Error::new(
+                        ErrorKind::Other,
+                        format!("1 - {} - {:?}", e, len),
+                    )))
+                }
+            }
+
+            let len = u32::from_be_bytes(len).try_into().unwrap();
+
+            println!("[{}] Reading {} bytes from TCP stream", index, len);
+
+            if len > buf.len() {
+                return Some(Err(Error::new(
+                    ErrorKind::Other,
+                    format!("Frame size too big: {}", len),
+                )));
+            }
+
+            progress_opt.replace(TCPProgress { len, nbytes: 0 });
+            progress_opt.as_mut().unwrap()
+        }
+    };
+
+    loop {
+        progress.nbytes += match stream
+            .read_exact(&mut buf[progress.nbytes..progress.len])
+            .await
+        {
+            Ok(n) if n != 0 => n,
+            Ok(_) => return Some(Err(Error::new(ErrorKind::Other, "Unexpected EOF"))),
+            Err(e) => return Some(Err(Error::new(ErrorKind::Other, format!("2 - {}", e)))),
+        };
+
+        if progress.nbytes == progress.len {
+            let len = progress.len;
+            progress_opt.take();
+            break Some(Ok(&mut buf[..len]));
         }
     }
-
-    let len = u32::from_be_bytes(len).try_into().unwrap();
-
-    println!("[{}] Reading {} bytes from TCP stream", index, len);
-
-    if len > buf.len() {
-        return Some(Err(Error::new(
-            ErrorKind::Other,
-            format!("Frame size too big: {}", len),
-        )));
-    }
-
-    match stream.read_exact(&mut buf[..len]).await {
-        Ok(n) if n == len => {}
-        Ok(_) => return Some(Err(Error::new(ErrorKind::Other, "Unexpected EOF"))),
-        Err(e) => return Some(Err(Error::new(ErrorKind::Other, format!("2 - {}", e)))),
-    }
-
-    Some(Ok(&mut buf[..len]))
 }
 
-pub async fn send_packet<'a>(stream: &mut TcpStream, buf: &[u8], index: usize) -> Result<()> {
+async fn send_packet<'a>(stream: &mut TcpStream, buf: &[u8], index: usize) -> Result<()> {
     if buf.len() > 65575 + 24 + 16 {
         return Err(Error::new(ErrorKind::Other, "Frame size too big"));
     }
