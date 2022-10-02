@@ -11,7 +11,7 @@ use std::{
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    time::timeout,
+    time::{interval, timeout},
 };
 
 use chacha20poly1305::{
@@ -19,8 +19,8 @@ use chacha20poly1305::{
     Tag, XChaCha20Poly1305, XNonce,
 };
 
-use etherparse::{IpHeader, PacketHeaders, TransportHeader};
-use futures::{future::Either, Future, Stream, StreamExt};
+use etherparse::{IpHeader, PacketBuilder, PacketHeaders, TransportHeader};
+use futures::{future::Either, Future, Stream, StreamExt, TryFutureExt};
 use headers::{HeaderName, HeaderValue};
 use httparse::{Request, Status, EMPTY_HEADER};
 use tokio_tun::{Tun, TunBuilder};
@@ -86,8 +86,14 @@ async fn main() {
                     Some((
                         i,
                         Box::pin(async move {
-                            let (mut stream, addr) = x?;
+                            let (stream, addr) = x?;
                             println!("[{}] Connection from {}", i, addr);
+
+                            let stream = stream.into_std()?;
+                            stream.set_read_timeout(Duration::from_secs(10).into())?;
+                            stream.set_write_timeout(Duration::from_secs(10).into())?;
+
+                            let mut stream = TcpStream::from_std(stream)?;
 
                             match http_proxy_server(&mut stream).await {
                                 Ok(_) => {}
@@ -122,6 +128,14 @@ async fn main() {
                         )));
                     }
                 };
+
+                stream
+                    .set_read_timeout(Duration::from_secs(10).into())
+                    .expect("Failed to set TCP socket's read timeout");
+
+                stream
+                    .set_write_timeout(Duration::from_secs(10).into())
+                    .expect("Failed to set TCP socket's write timeout");
 
                 stream
                     .set_nonblocking(true)
@@ -190,6 +204,12 @@ async fn handle_stream(
 ) -> Result<()> {
     let cipher = key.as_ref().map(|key| XChaCha20Poly1305::new(&key.0));
 
+    let builder =
+        PacketBuilder::ipv4([127, 0, 0, 1], [127, 0, 0, 1], 1).icmpv4_echo_request(123, 456);
+    let payload = [1, 2, 3, 4, 5, 6, 7, 8];
+    let mut dummy_packet = Vec::<u8>::with_capacity(builder.size(payload.len()));
+    builder.write(&mut dummy_packet, &payload).unwrap();
+
     let mut buf_tun = [0u8; 65575 + 24 + 16];
     let mut buf_tcp = [0u8; 65575 + 24 + 16];
 
@@ -202,11 +222,12 @@ async fn handle_stream(
     let mut tcp_progress_tx: Option<TCPProgressTX> = None;
 
     let (mut stream_rx, mut stream_tx) = stream.split();
+    let mut keepalive = interval(Duration::from_secs(1));
 
     loop {
         let tun_read = async {
             if tcp_progress_tx.is_some() {
-                return Either::Left(stream_tx.writable().await.map(|_| &mut tcp_progress_tx));
+                return Either::Left(stream_tx.writable().map_ok(|_| &mut tcp_progress_tx).await);
             }
 
             Either::Right(tun.read(&mut buf_tun[24 + 16..]).await)
@@ -221,6 +242,10 @@ async fn handle_stream(
                 Some(v) => v?,
                 None => break,
             }),
+            _ = keepalive.tick() => {
+                tun.write_all(&dummy_packet).await?;
+                continue;
+            }
         };
 
         match either {
