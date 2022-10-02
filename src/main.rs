@@ -2,14 +2,16 @@ mod clap;
 
 use std::{
     io::{Error, ErrorKind, Result},
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    mem::MaybeUninit,
+    net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr},
     pin::Pin,
+    sync::Mutex,
     task::Poll,
     time::Duration,
 };
 
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf},
     net::{TcpListener, TcpStream},
     time::timeout,
 };
@@ -20,13 +22,16 @@ use chacha20poly1305::{
 };
 
 use etherparse::{IpHeader, PacketHeaders, TransportHeader};
-use futures::{future::Either, Future, Stream, StreamExt};
+use futures::{Future, Stream, StreamExt};
 use headers::{HeaderName, HeaderValue};
 use httparse::{Request, Status, EMPTY_HEADER};
 use tokio_tun::{Tun, TunBuilder};
 use zeroize::Zeroizing;
 
 use self::clap::InstanceType;
+
+const TUN_RX: Mutex<MaybeUninit<ReadHalf<Tun>>> = Mutex::new(MaybeUninit::uninit());
+const TUN_TX: Mutex<MaybeUninit<WriteHalf<Tun>>> = Mutex::new(MaybeUninit::uninit());
 
 #[derive(Clone, Copy)]
 struct TCPProgress {
@@ -38,6 +43,16 @@ struct TCPProgress {
 async fn main() {
     let config = clap::get_config();
 
+    /*let mut tun = tun::Configuration::default();
+
+    tun.name(&config.interface_name).up();
+
+    if let Some(address) = config.interface_address {
+        tun.address(address.addr()).netmask(address.netmask());
+    }
+
+    let mut tun = tun::create(&tun).expect("Failed to create TUN device");*/
+
     let mut tun = TunBuilder::new()
         .name(&config.interface_name)
         .tap(false)
@@ -48,7 +63,12 @@ async fn main() {
         tun = tun.address(address.addr()).netmask(address.netmask());
     }
 
-    let mut tun = tun.try_build().expect("Failed to build TUN device");
+    let tun = tun.try_build().expect("Failed to build TUN device");
+    let (tun_rx, tun_tx) = tokio::io::split(tun);
+
+    TUN_RX.lock().unwrap().write(tun_rx);
+    TUN_TX.lock().unwrap().write(tun_tx);
+
     let mut i = 0;
 
     type StreamItem = (
@@ -139,7 +159,7 @@ async fn main() {
     };
 
     while let Some((i, n)) = stream.next().await {
-        let (mut stream, _) = match n.await {
+        let (stream, _) = match n.await {
             Ok(n) => n,
             Err(e) => {
                 println!("[{}] Error: {}", i, e);
@@ -161,108 +181,53 @@ async fn main() {
 
         println!("[{}] Finished HTTP proxy exchange", i);
 
-        if let Err(e) = handle_stream(&mut stream, &mut tun, &config.key, config.debug, i).await {
+        let (stream1, stream2) = match stream
+            .into_std()
+            .and_then(|x| x.try_clone().map(|y| (x, y)))
+            .and_then(|(x, y)| TcpStream::from_std(x).map(|x| (x, y)))
+        {
+            Ok(n) => n,
+            Err(e) => {
+                println!("[{}] Failed to clone TcpStream: {}", i, e);
+                println!("[{}] Closed connection\n", i);
+                continue;
+            }
+        };
+
+        if let Err(e) = handle_stream(stream1, &config.key, config.debug, i).await {
             println!("[{}] Error: {}", i, e);
         }
 
-        stream.shutdown().await.ok();
+        stream2.shutdown(Shutdown::Both).ok();
 
         println!("[{}] Closed connection\n", i);
     }
 }
 
 async fn handle_stream(
-    stream: &mut TcpStream,
-    tun: &mut Tun,
+    stream: TcpStream,
     key: &Option<Zeroizing<clap::Key>>,
     debug: bool,
     index: usize,
-) -> Result<()> {
+) -> std::result::Result<(), Error> {
     let cipher = key.as_ref().map(|key| XChaCha20Poly1305::new(&key.0));
 
     let mut buf_tun = [0u8; 65575 + 24 + 16];
     let mut buf_tcp = [0u8; 65575 + 24 + 16];
 
-    let mut tcp_progress: Option<TCPProgress> = None;
+    let (mut tcp_rx, mut tcp_tx) = tokio::io::split(stream);
 
-    let tun_handle = tokio::spawn(async move {});
-    let tcp_handle = tokio::spawn(async move {});
+    let tun_handle = tokio::spawn(async move { loop {} });
 
-    tun_handle.await?;
+    let tcp_handle = tokio::spawn(async move {
+        let mut tcp_progress = None;
 
-    loop {
-        let either = tokio::select! {
-            v = tun.read(&mut buf_tun[24 + 16..]) => Either::Left(v?),
-            v = next_packet(stream, &mut buf_tcp, &mut tcp_progress, index) => Either::Right(match v {
-                Some(v) => v?,
-                None => break,
-            }),
-        };
-
-        match either {
-            Either::Left(nbytes) => {
-                if debug {
-                    println!("[{}] Read {} bytes from TUN device", index, nbytes);
-
-                    debug_packet(
-                        &buf_tun[24 + 16..24 + 16 + nbytes],
-                        "Sending packet to stream",
-                        index,
-                    )?;
-                }
-
-                let mut offset = 24 + 16;
-
-                if let Some(cipher) = &cipher {
-                    let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-                    let tag = cipher
-                        .encrypt_in_place_detached(
-                            &nonce,
-                            b"",
-                            &mut buf_tun[24 + 16..24 + 16 + nbytes],
-                        )
-                        .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
-
-                    buf_tun[..24].copy_from_slice(nonce.as_slice());
-                    buf_tun[24..24 + 16].copy_from_slice(tag.as_slice());
-
-                    offset = 0;
-                }
-
-                send_packet(stream, &buf_tun[offset..24 + 16 + nbytes], index).await?;
-            }
-            Either::Right(buf) => {
-                let mut offset = 0;
-
-                if debug {
-                    println!("[{}] Read {} bytes from TCP stream", index, buf.len());
-                }
-
-                if let Some(cipher) = &cipher {
-                    offset = 24 + 16;
-
-                    let (header, buf) = buf.split_at_mut(24 + 16);
-
-                    let nonce = XNonce::from_slice(&header[..24]);
-                    let tag = Tag::from_slice(&header[24..]);
-
-                    cipher
-                        .decrypt_in_place_detached(nonce, b"", buf, tag)
-                        .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
-                }
-
-                let buf = &buf.as_ref()[offset..];
-
-                if debug {
-                    debug_packet(buf, "Received packet from stream", index)?;
-                }
-
-                tun.write_all(buf).await?;
-            }
+        loop {
+            next_packet(&mut tcp_rx, &mut buf_tcp, &mut tcp_progress, index);
         }
-    }
+    });
 
-    Ok(())
+    todo!()
 }
 
 async fn next_packet<'a, S>(
