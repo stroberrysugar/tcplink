@@ -16,6 +16,5 @@ httparse = "1.8"
 ipnet = "2.5"
 tokio = { version = "1", features = ["rt-multi-thread", "io-util", "net", "time", "sync", "parking_lot", "macros"] }
 tokio-tun = "0.7"
-tun = "0.5"
 typenum = "1.15"
 zeroize = { version = "1.5", features = ["zeroize_derive"] }
