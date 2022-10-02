@@ -2,16 +2,14 @@ mod clap;
 
 use std::{
     io::{Error, ErrorKind, Result},
-    mem::MaybeUninit,
-    net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
-    sync::Mutex,
     task::Poll,
     time::Duration,
 };
 
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     time::timeout,
 };
@@ -22,7 +20,7 @@ use chacha20poly1305::{
 };
 
 use etherparse::{IpHeader, PacketHeaders, TransportHeader};
-use futures::{Future, Stream, StreamExt};
+use futures::{future::Either, Future, Stream, StreamExt};
 use headers::{HeaderName, HeaderValue};
 use httparse::{Request, Status, EMPTY_HEADER};
 use tokio_tun::{Tun, TunBuilder};
@@ -30,28 +28,25 @@ use zeroize::Zeroizing;
 
 use self::clap::InstanceType;
 
-const TUN_RX: Mutex<MaybeUninit<ReadHalf<Tun>>> = Mutex::new(MaybeUninit::uninit());
-const TUN_TX: Mutex<MaybeUninit<WriteHalf<Tun>>> = Mutex::new(MaybeUninit::uninit());
+#[derive(Clone, Copy)]
+struct TCPProgressRX {
+    len: Option<usize>,
+    buf_len: [u8; 4],
+    nbytes: usize,
+    nbytes_len: usize,
+}
 
 #[derive(Clone, Copy)]
-struct TCPProgress {
+struct TCPProgressTX {
+    buf: *const u8,
     len: usize,
     nbytes: usize,
+    nbytes_len: usize,
 }
 
 #[tokio::main]
 async fn main() {
     let config = clap::get_config();
-
-    /*let mut tun = tun::Configuration::default();
-
-    tun.name(&config.interface_name).up();
-
-    if let Some(address) = config.interface_address {
-        tun.address(address.addr()).netmask(address.netmask());
-    }
-
-    let mut tun = tun::create(&tun).expect("Failed to create TUN device");*/
 
     let mut tun = TunBuilder::new()
         .name(&config.interface_name)
@@ -63,12 +58,7 @@ async fn main() {
         tun = tun.address(address.addr()).netmask(address.netmask());
     }
 
-    let tun = tun.try_build().expect("Failed to build TUN device");
-    let (tun_rx, tun_tx) = tokio::io::split(tun);
-
-    TUN_RX.lock().unwrap().write(tun_rx);
-    TUN_TX.lock().unwrap().write(tun_tx);
-
+    let mut tun = tun.try_build().expect("Failed to build TUN device");
     let mut i = 0;
 
     type StreamItem = (
@@ -159,7 +149,7 @@ async fn main() {
     };
 
     while let Some((i, n)) = stream.next().await {
-        let (stream, _) = match n.await {
+        let (mut stream, _) = match n.await {
             Ok(n) => n,
             Err(e) => {
                 println!("[{}] Error: {}", i, e);
@@ -181,128 +171,244 @@ async fn main() {
 
         println!("[{}] Finished HTTP proxy exchange", i);
 
-        let (stream1, stream2) = match stream
-            .into_std()
-            .and_then(|x| x.try_clone().map(|y| (x, y)))
-            .and_then(|(x, y)| TcpStream::from_std(x).map(|x| (x, y)))
-        {
-            Ok(n) => n,
-            Err(e) => {
-                println!("[{}] Failed to clone TcpStream: {}", i, e);
-                println!("[{}] Closed connection\n", i);
-                continue;
-            }
-        };
-
-        if let Err(e) = handle_stream(stream1, &config.key, config.debug, i).await {
+        if let Err(e) = handle_stream(&mut stream, &mut tun, &config.key, config.debug, i).await {
             println!("[{}] Error: {}", i, e);
         }
 
-        stream2.shutdown(Shutdown::Both).ok();
+        stream.shutdown().await.ok();
 
         println!("[{}] Closed connection\n", i);
     }
 }
 
 async fn handle_stream(
-    stream: TcpStream,
+    stream: &mut TcpStream,
+    tun: &mut Tun,
     key: &Option<Zeroizing<clap::Key>>,
     debug: bool,
     index: usize,
-) -> std::result::Result<(), Error> {
+) -> Result<()> {
     let cipher = key.as_ref().map(|key| XChaCha20Poly1305::new(&key.0));
 
     let mut buf_tun = [0u8; 65575 + 24 + 16];
     let mut buf_tcp = [0u8; 65575 + 24 + 16];
 
-    let (mut tcp_rx, mut tcp_tx) = tokio::io::split(stream);
+    let mut tcp_progress_rx: TCPProgressRX = TCPProgressRX {
+        len: None,
+        buf_len: [0u8; 4],
+        nbytes: 0,
+        nbytes_len: 0,
+    };
+    let mut tcp_progress_tx: Option<TCPProgressTX> = None;
 
-    let tun_handle = tokio::spawn(async move { loop {} });
+    let (mut stream_rx, mut stream_tx) = stream.split();
 
-    let tcp_handle = tokio::spawn(async move {
-        let mut tcp_progress = None;
+    loop {
+        let tun_read = async {
+            if tcp_progress_tx.is_some() {
+                return Either::Left(stream_tx.writable().await.map(|_| &mut tcp_progress_tx));
+            }
 
-        loop {
-            next_packet(&mut tcp_rx, &mut buf_tcp, &mut tcp_progress, index);
+            Either::Right(tun.read(&mut buf_tun[24 + 16..]).await)
+        };
+
+        let either = tokio::select! {
+            v = tun_read => Either::Left(match v {
+                Either::Left(v) => Either::Left(v?),
+                Either::Right(v) => Either::Right(v?),
+            }),
+            v = next_packet(&mut stream_rx, &mut buf_tcp, &mut tcp_progress_rx, index) => Either::Right(match v {
+                Some(v) => v?,
+                None => break,
+            }),
+        };
+
+        match either {
+            Either::Left(res) => match res {
+                Either::Left(progress) => {
+                    match send_packet(&mut stream_tx, progress.as_mut().unwrap(), index).await {
+                        Ok(_) => {
+                            progress.take();
+                        }
+                        Err(e) => {
+                            progress.take();
+                            return Err(e);
+                        }
+                    }
+                }
+                Either::Right(nbytes) => {
+                    if debug {
+                        println!("[{}] Read {} bytes from TUN device", index, nbytes);
+
+                        debug_packet(
+                            &buf_tun[24 + 16..24 + 16 + nbytes],
+                            "Sending packet to stream",
+                            index,
+                        )?;
+                    }
+
+                    let mut offset = 24 + 16;
+
+                    if let Some(cipher) = &cipher {
+                        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+                        let tag = cipher
+                            .encrypt_in_place_detached(
+                                &nonce,
+                                b"",
+                                &mut buf_tun[24 + 16..24 + 16 + nbytes],
+                            )
+                            .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
+
+                        buf_tun[..24].copy_from_slice(nonce.as_slice());
+                        buf_tun[24..24 + 16].copy_from_slice(tag.as_slice());
+
+                        offset = 0;
+                    }
+
+                    let buf = &buf_tun[offset..24 + 16 + nbytes];
+
+                    tcp_progress_tx.replace(TCPProgressTX {
+                        buf: buf.as_ptr(),
+                        len: buf.len(),
+                        nbytes: 0,
+                        nbytes_len: 0,
+                    });
+                }
+            },
+            Either::Right(buf) => {
+                let mut offset = 0;
+
+                if debug {
+                    println!("[{}] Read {} bytes from TCP stream", index, buf.len());
+                }
+
+                if let Some(cipher) = &cipher {
+                    offset = 24 + 16;
+
+                    let (header, buf) = buf.split_at_mut(24 + 16);
+
+                    let nonce = XNonce::from_slice(&header[..24]);
+                    let tag = Tag::from_slice(&header[24..]);
+
+                    cipher
+                        .decrypt_in_place_detached(nonce, b"", buf, tag)
+                        .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
+                }
+
+                let buf = &buf.as_ref()[offset..];
+
+                if debug {
+                    debug_packet(buf, "Received packet from stream", index)?;
+                }
+
+                tun.write_all(buf).await?;
+            }
         }
-    });
+    }
 
-    todo!()
+    Ok(())
 }
 
 async fn next_packet<'a, S>(
     stream: &mut S,
     buf: &'a mut [u8; 65575 + 24 + 16],
-    progress_opt: &mut Option<TCPProgress>,
+    progress: &mut TCPProgressRX,
     index: usize,
 ) -> Option<Result<&'a mut [u8]>>
 where
     S: AsyncRead + Unpin,
 {
-    let progress = match progress_opt {
+    let len = match progress.len {
         Some(n) => n,
         None => {
-            let mut len = [0u8; 4];
+            loop {
+                progress.nbytes_len += match stream
+                    .read(&mut progress.buf_len[progress.nbytes_len..])
+                    .await
+                {
+                    Ok(n) => n,
+                    Err(e) => return Some(Err(e)),
+                };
 
-            match stream.read_exact(&mut len).await {
-                Ok(n) if n == 4 => {}
-                Ok(_) => return Some(Err(Error::new(ErrorKind::Other, "Unexpected EOF"))),
-                Err(e) => {
-                    return Some(Err(Error::new(
-                        ErrorKind::Other,
-                        format!("1 - {} - {:?}", e, len),
-                    )))
+                if progress.nbytes_len == progress.buf_len.len() {
+                    break;
                 }
             }
 
-            let len = u32::from_be_bytes(len).try_into().unwrap();
-
-            println!("[{}] Reading {} bytes from TCP stream", index, len);
-
-            if len > buf.len() {
-                return Some(Err(Error::new(
-                    ErrorKind::Other,
-                    format!("Frame size too big: {}", len),
-                )));
-            }
-
-            progress_opt.replace(TCPProgress { len, nbytes: 0 });
-            progress_opt.as_mut().unwrap()
+            progress.nbytes_len = 0;
+            progress.len = Some(u32::from_be_bytes(progress.buf_len).try_into().unwrap());
+            progress.len.unwrap()
         }
     };
 
+    if progress.nbytes == 0 {
+        println!("[{}] Reading {} bytes from TCP stream", index, len);
+    }
+
     loop {
-        progress.nbytes += match stream
-            .read_exact(&mut buf[progress.nbytes..progress.len])
-            .await
-        {
+        progress.nbytes += match stream.read(&mut buf[progress.nbytes..len]).await {
             Ok(n) if n != 0 => n,
             Ok(_) => return Some(Err(Error::new(ErrorKind::Other, "Unexpected EOF"))),
             Err(e) => return Some(Err(Error::new(ErrorKind::Other, format!("2 - {}", e)))),
         };
 
-        if progress.nbytes == progress.len {
-            let len = progress.len;
-            progress_opt.take();
+        if progress.nbytes == len {
+            progress.len = None;
+            progress.nbytes = 0;
+
             break Some(Ok(&mut buf[..len]));
         }
     }
 }
 
-async fn send_packet<'a>(stream: &mut TcpStream, buf: &[u8], index: usize) -> Result<()> {
+async fn send_packet<'a, S>(
+    stream: &mut S,
+    progress: &mut TCPProgressTX,
+    index: usize,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let buf = unsafe { std::slice::from_raw_parts(progress.buf, progress.len) };
+
     if buf.len() > 65575 + 24 + 16 {
         return Err(Error::new(ErrorKind::Other, "Frame size too big"));
     }
 
-    println!("[{}] Writing {} bytes to TCP stream", index, buf.len());
+    if progress.nbytes == 0 {
+        if progress.nbytes_len == 0 {
+            println!("[{}] Writing {} bytes to TCP stream", index, buf.len());
+        }
 
-    let len: u32 = buf.len().try_into().unwrap();
-    let len = len.to_be_bytes();
+        let len: u32 = buf.len().try_into().unwrap();
+        let len = len.to_be_bytes();
 
-    stream.write_all(&len).await?;
-    stream.write_all(buf).await?;
+        loop {
+            progress.nbytes_len += stream.write(&len[progress.nbytes_len..]).await?;
 
-    Ok(())
+            if progress.nbytes_len == len.len() {
+                break;
+            }
+        }
+    }
+
+    loop {
+        let nbytes = stream.write(&buf[progress.nbytes..]).await?;
+
+        println!(
+            "[{}] Wrote {}/{} bytes to TCP stream",
+            index,
+            nbytes,
+            buf.len()
+        );
+
+        progress.nbytes += nbytes;
+
+        if progress.nbytes == buf.len() {
+            println!("[{}] Finished writing to TCP stream", index);
+            return Ok(());
+        }
+    }
 }
 
 async fn http_proxy_client(
