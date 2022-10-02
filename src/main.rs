@@ -217,7 +217,7 @@ async fn handle_stream(
                 Either::Left(v) => Either::Left(v?),
                 Either::Right(v) => Either::Right(v?),
             }),
-            v = next_packet(&mut stream_rx, &mut buf_tcp, &mut tcp_progress_rx, index) => Either::Right(match v {
+            v = next_packet(&mut stream_rx, &mut buf_tcp, &mut tcp_progress_rx, index, debug) => Either::Right(match v {
                 Some(v) => v?,
                 None => break,
             }),
@@ -226,7 +226,9 @@ async fn handle_stream(
         match either {
             Either::Left(res) => match res {
                 Either::Left(progress) => {
-                    match send_packet(&mut stream_tx, progress.as_mut().unwrap(), index).await {
+                    match send_packet(&mut stream_tx, progress.as_mut().unwrap(), index, debug)
+                        .await
+                    {
                         Ok(_) => {
                             progress.take();
                         }
@@ -314,6 +316,7 @@ async fn next_packet<'a, S>(
     buf: &'a mut [u8; 65575 + 24 + 16],
     progress: &mut TCPProgressRX,
     index: usize,
+    debug: bool,
 ) -> Option<Result<&'a mut [u8]>>
 where
     S: AsyncRead + Unpin,
@@ -341,7 +344,7 @@ where
         }
     };
 
-    if progress.nbytes == 0 {
+    if progress.nbytes == 0 && debug {
         println!("[{}] Reading {} bytes from TCP stream", index, len);
     }
 
@@ -365,6 +368,7 @@ async fn send_packet<'a, S>(
     stream: &mut S,
     progress: &mut TCPProgressTX,
     index: usize,
+    debug: bool,
 ) -> Result<()>
 where
     S: AsyncWrite + Unpin,
@@ -376,7 +380,7 @@ where
     }
 
     if progress.nbytes == 0 {
-        if progress.nbytes_len == 0 {
+        if progress.nbytes_len == 0 && debug {
             println!("[{}] Writing {} bytes to TCP stream", index, buf.len());
         }
 
@@ -395,17 +399,21 @@ where
     loop {
         let nbytes = stream.write(&buf[progress.nbytes..]).await?;
 
-        println!(
-            "[{}] Wrote {}/{} bytes to TCP stream",
-            index,
-            nbytes,
-            buf.len()
-        );
+        if debug {
+            println!(
+                "[{}] Wrote {}/{} bytes to TCP stream",
+                index,
+                nbytes,
+                buf.len()
+            );
+        }
 
         progress.nbytes += nbytes;
 
         if progress.nbytes == buf.len() {
-            println!("[{}] Finished writing to TCP stream", index);
+            if debug {
+                println!("[{}] Finished writing to TCP stream", index);
+            }
             return Ok(());
         }
     }
